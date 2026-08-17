@@ -10,12 +10,21 @@
  *   /agents                 — Interactive agent management menu
  */
 
-import { existsSync, mkdirSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
+import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext, getAgentDir, getSettingsListTheme, type InputEventResult } from "@earendil-works/pi-coding-agent";
 import { Container, Key, matchesKey, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { abortable } from "./abortable.js";
+import {
+  appendAetherSubagentMessage,
+  type MentionDispatchResult,
+  registerSubagentsBridge,
+  type SubagentSnapshotAgent,
+  type SubagentsPiBridge,
+  type SubagentsSnapshot,
+  unregisterSubagentsBridge,
+} from "./aether.js";
 import { hasAgentBadge, renderAgentName } from "./agent-color.js";
 import { buildNewAgentFile, disableInContent, enableInContent, isEmptyStub, locateAgentFile, personalAgentsDir, projectAgentsDir, serializeAgentFile } from "./agent-file-toggle.js";
 import { AgentManager } from "./agent-manager.js";
@@ -369,13 +378,15 @@ export default function (pi: ExtensionAPI) {
 
     const notification = formatTaskNotification(record, 500);
     const footer = record.outputFile ? `\nFull transcript available at: ${record.outputFile}` : '';
+    const details = buildNotificationDetails(record, 500, agentActivity.get(record.id));
 
     pi.sendMessage<NotificationDetails>({
       customType: "subagent-notification",
       content: notification + footer,
       display: true,
-      details: buildNotificationDetails(record, 500, agentActivity.get(record.id)),
+      details,
     }, { deliverAs: "followUp", triggerTurn: true });
+    void appendAetherSubagentMessage("subagent-notification", { ...details }, notification + footer);
   }
 
   function sendIndividualNudge(record: AgentRecord) {
@@ -414,6 +425,11 @@ export default function (pi: ExtensionAPI) {
           display: true,
           details,
         }, { deliverAs: "followUp", triggerTurn: true });
+        void appendAetherSubagentMessage(
+          "subagent-notification",
+          { ...details },
+          `Background agent group completed: ${label}\n\n${notifications}\n\nUse get_subagent_result for full output.`,
+        );
       });
       widget.update();
     },
@@ -693,7 +709,11 @@ export default function (pi: ExtensionAPI) {
    * main-model turn; the answer arrives through the ordinary completion
    * notification either way.
    */
-  pi.on("input", async (event, ctx) => {
+  const handleMentionInput = async (
+    event: { text: string; source?: string; images?: unknown },
+    ctx: ExtensionContext,
+    forceDirect: boolean,
+  ): Promise<MentionDispatchResult> => {
     // Never hijack text the extension layer itself submitted (pi.sendMessage,
     // scheduled prompts) — only something a person typed can be a mention.
     if (event.source === "extension" || !isAgentMentionsEnabled()) return { action: "continue" };
@@ -710,7 +730,7 @@ export default function (pi: ExtensionAPI) {
     // turn run, so the answer is the model's own, printed as usual. It is the
     // only branch allowed to act headlessly; everything else falls through to
     // the main model exactly as it did before mentions existed.
-    const canDispatchDirectly = ctx.mode === "tui";
+    const canDispatchDirectly = forceDirect || ctx.mode === "tui";
     if (!canDispatchDirectly && getAgentMentionMode() !== "model") return { action: "continue" };
 
     const mention = parseMention(event.text);
@@ -721,7 +741,7 @@ export default function (pi: ExtensionAPI) {
     // that would otherwise read as a mention, so the prefix is dropped and the
     // rest goes to the model with its attachments intact.
     if (isReservedHandle(mention.handle)) {
-      return { action: "transform", text: mention.message, ...(event.images && { images: event.images }) };
+      return { action: "transform", text: mention.message, ...(event.images !== undefined && { images: event.images }) };
     }
 
     // As typed first, so an agent actually called `agent-foo` wins over Claude
@@ -897,6 +917,11 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`Could not start @${handleBase(type)}: ${err instanceof Error ? err.message : String(err)}`, "error");
     }
     return { action: "handled" };
+  };
+
+  pi.on("input", async (event, ctx) => {
+    if (event.source === "extension" || !isAgentMentionsEnabled()) return { action: "continue" };
+    return handleMentionInput(event, ctx, false) as Promise<InputEventResult>;
   });
 
   pi.on("session_before_switch", () => {
@@ -923,6 +948,8 @@ export default function (pi: ExtensionAPI) {
     pendingNudges.clear();
     fleet.dispose();
     manager.dispose();
+    clearInterval(aetherRefreshTimer);
+    unregisterSubagentsBridge(aetherBridge);
   });
 
   // Live widget: show running agents above editor.
@@ -2650,6 +2677,119 @@ Write the file using the write tool. Only write the file, nothing else.`;
 
   const NUMERIC_IDS = new Set(["maxConcurrent", "defaultMaxTurns", "graceTurns", "maxSubagentDepth"]);
 
+  /** Apply one settings value to in-memory runtime state without persisting. */
+  function applySettingToRuntime(id: string, raw: unknown): { message: string; changed: boolean } | undefined {
+    const value = typeof raw === "boolean" ? (raw ? "on" : "off") : String(raw);
+    if (id === "maxConcurrent") {
+      const n = parseInt(value, 10);
+      if (n < 1) return undefined;
+      manager.setMaxConcurrent(n);
+      return { message: `Max concurrency set to ${n}`, changed: true };
+    }
+    if (id === "defaultMaxTurns") {
+      const n = parseInt(value, 10);
+      if (n === 0) {
+        setDefaultMaxTurns(undefined);
+        return { message: "Default max turns set to unlimited", changed: true };
+      }
+      if (n < 1) return undefined;
+      setDefaultMaxTurns(n);
+      return { message: `Default max turns set to ${n}`, changed: true };
+    }
+    if (id === "graceTurns") {
+      const n = parseInt(value, 10);
+      if (n < 1) return undefined;
+      setGraceTurns(n);
+      return { message: `Grace turns set to ${n}`, changed: true };
+    }
+    if (id === "maxSubagentDepth") {
+      const n = parseInt(value, 10);
+      if (n < 0) return undefined;
+      setMaxSubagentDepth(n);
+      return {
+        message: n <= 1 ? "Nested delegation disabled" : `Nested depth set to ${n}. Applies to agents started from now on.`,
+        changed: true,
+      };
+    }
+    if (id === "joinMode") {
+      setDefaultJoinMode(value as JoinMode);
+      return { message: `Default join mode set to ${value}`, changed: true };
+    }
+    if (id === "schedulingEnabled") {
+      const enabled = value === "on";
+      if (enabled === isSchedulingEnabled()) {
+        return { message: `Scheduling already ${enabled ? "enabled" : "disabled"}.`, changed: false };
+      }
+      setSchedulingEnabled(enabled);
+      if (!enabled) scheduler.stop();  // immediate kill — outstanding fires stop ticking
+      return { message: `Scheduling ${enabled ? "enabled" : "disabled"}. Tool spec change takes effect on next pi session.`, changed: true };
+    }
+    if (id === "scopeModels") {
+      const enabled = value === "on";
+      setScopeModelsEnabled(enabled);
+      return { message: `Scope models ${enabled ? "enabled" : "disabled"}`, changed: true };
+    }
+    if (id === "strictAgentFiles") {
+      const enabled = value === "on";
+      strictAgentFiles = enabled;
+      return { message: `Strict agent files ${enabled ? "enabled" : "disabled"}. Takes effect on next pi session.`, changed: true };
+    }
+    if (id === "disableDefaultAgents") {
+      const enabled = value === "on";
+      setDisableDefaultAgents(enabled);
+      return { message: `Default agents ${enabled ? "disabled" : "enabled"}. Tool spec change takes effect on next pi session.`, changed: true };
+    }
+    if (id === "fallbackSubagent") {
+      if (value === "") {
+        setFallbackSubagent(undefined);
+        return { message: "Unknown agent types will fall back to general-purpose", changed: true };
+      }
+      setFallbackSubagent(value);
+      return {
+        message: value === NO_FALLBACK
+          ? "Unknown or disabled agent types will now be rejected"
+          : `Unknown agent types will fall back to ${value}`,
+        changed: true,
+      };
+    }
+    if (id === "outputTranscript") {
+      const enabled = value === "on";
+      setOutputTranscriptDefault(enabled);
+      return { message: `Output transcript ${enabled ? "enabled" : "disabled"} by default`, changed: true };
+    }
+    if (id === "toolDescriptionMode") {
+      setToolDescriptionMode(value as ToolDescriptionMode);
+      return { message: `Tool description set to ${value}. Takes effect on next pi session.`, changed: true };
+    }
+    if (id === "fleetView") {
+      const enabled = value === "on";
+      setFleetViewEnabled(enabled);
+      return { message: `Fleet view ${enabled ? "enabled" : "disabled"}`, changed: true };
+    }
+    if (id === "agentMentions") {
+      const mode = value as AgentMentionMode;
+      setAgentMentionMode(mode);
+      return {
+        message: mode === "off"
+          ? "Agent mentions disabled"
+          : mode === "model"
+            ? "Agent mentions on — a conversation clone starts a mentioned agent off-screen"
+            : "Agent mentions on — a mentioned agent starts here, with no model call",
+        changed: true,
+      };
+    }
+    if (id === "rememberAgents") {
+      const enabled = value === "on";
+      setRememberAgents(enabled);
+      return { message: `Remember agents ${enabled ? "enabled" : "disabled"}`, changed: true };
+    }
+    if (id === "widgetMode") {
+      setWidgetMode(value as WidgetMode);
+      return { message: `Widget set to ${value}`, changed: true };
+    }
+    return undefined;
+  }
+
   async function showSettings(ctx: ExtensionCommandContext) {
     function buildItems(): SettingItem[] {
       const mc = manager.getMaxConcurrent();
@@ -2781,103 +2921,13 @@ Write the file using the write tool. Only write the file, nothing else.`;
     }
 
     function applyValue(id: string, value: string) {
-      if (id === "maxConcurrent") {
-        const n = parseInt(value, 10);
-        if (n >= 1) {
-          manager.setMaxConcurrent(n);
-          notifyApplied(ctx, `Max concurrency set to ${n}`);
-        }
-      } else if (id === "defaultMaxTurns") {
-        const n = parseInt(value, 10);
-        if (n === 0) {
-          setDefaultMaxTurns(undefined);
-          notifyApplied(ctx, "Default max turns set to unlimited");
-        } else if (n >= 1) {
-          setDefaultMaxTurns(n);
-          notifyApplied(ctx, `Default max turns set to ${n}`);
-        }
-      } else if (id === "graceTurns") {
-        const n = parseInt(value, 10);
-        if (n >= 1) {
-          setGraceTurns(n);
-          notifyApplied(ctx, `Grace turns set to ${n}`);
-        }
-      } else if (id === "maxSubagentDepth") {
-        const n = parseInt(value, 10);
-        if (n >= 0) {
-          setMaxSubagentDepth(n);
-          notifyApplied(
-            ctx,
-            n <= 1
-              ? "Nested delegation disabled"
-              : `Nested depth set to ${n}. Applies to agents started from now on.`,
-          );
-        }
-      } else if (id === "joinMode") {
-        setDefaultJoinMode(value as JoinMode);
-        notifyApplied(ctx, `Default join mode set to ${value}`);
-      } else if (id === "schedulingEnabled") {
-        const enabled = value === "on";
-        if (enabled === isSchedulingEnabled()) {
-          ctx.ui.notify(`Scheduling already ${enabled ? "enabled" : "disabled"}.`, "info");
-        } else {
-          setSchedulingEnabled(enabled);
-          if (!enabled) scheduler.stop();  // immediate kill — outstanding fires stop ticking
-          notifyApplied(
-            ctx,
-            `Scheduling ${enabled ? "enabled" : "disabled"}. Tool spec change takes effect on next pi session.`,
-          );
-        }
-      } else if (id === "scopeModels") {
-        const enabled = value === "on";
-        setScopeModelsEnabled(enabled);
-        notifyApplied(ctx, `Scope models ${enabled ? "enabled" : "disabled"}`);
-      } else if (id === "strictAgentFiles") {
-        const enabled = value === "on";
-        strictAgentFiles = enabled;
-        notifyApplied(ctx, `Strict agent files ${enabled ? "enabled" : "disabled"}. Takes effect on next pi session.`);
-      } else if (id === "disableDefaultAgents") {
-        const enabled = value === "on";
-        setDisableDefaultAgents(enabled);
-        notifyApplied(ctx, `Default agents ${enabled ? "disabled" : "enabled"}. Tool spec change takes effect on next pi session.`);
-      } else if (id === "fallbackSubagent") {
-        setFallbackSubagent(value);
-        notifyApplied(
-          ctx,
-          value === NO_FALLBACK
-            ? "Unknown or disabled agent types will now be rejected"
-            : `Unknown agent types will fall back to ${value}`,
-        );
-      } else if (id === "outputTranscript") {
-        const enabled = value === "on";
-        setOutputTranscriptDefault(enabled);
-        notifyApplied(ctx, `Output transcript ${enabled ? "enabled" : "disabled"} by default`);
-      } else if (id === "toolDescriptionMode") {
-        setToolDescriptionMode(value as ToolDescriptionMode);
-        notifyApplied(ctx, `Tool description set to ${value}. Takes effect on next pi session.`);
-      } else if (id === "fleetView") {
-        const enabled = value === "on";
-        setFleetViewEnabled(enabled);
-        notifyApplied(ctx, `Fleet view ${enabled ? "enabled" : "disabled"}`);
-      } else if (id === "agentMentions") {
-        const mode = value as AgentMentionMode;
-        setAgentMentionMode(mode);
-        notifyApplied(
-          ctx,
-          mode === "off"
-            ? "Agent mentions disabled"
-            : mode === "model"
-              ? "Agent mentions on — a conversation clone starts a mentioned agent off-screen"
-              : "Agent mentions on — a mentioned agent starts here, with no model call",
-        );
-      } else if (id === "rememberAgents") {
-        const enabled = value === "on";
-        setRememberAgents(enabled);
-        notifyApplied(ctx, `Remember agents ${enabled ? "enabled" : "disabled"}`);
-      } else if (id === "widgetMode") {
-        setWidgetMode(value as WidgetMode);
-        notifyApplied(ctx, `Widget set to ${value}`);
+      const outcome = applySettingToRuntime(id, value);
+      if (!outcome) return;
+      if (id === "schedulingEnabled" && !outcome.changed) {
+        ctx.ui.notify(outcome.message, "info");
+        return;
       }
+      notifyApplied(ctx, outcome.message);
     }
 
     let list: SettingsList;
@@ -2971,6 +3021,148 @@ Write the file using the write tool. Only write the file, nothing else.`;
     );
     ctx.ui.notify(message, level);
   }
+
+  // ---- Aether Script Mod bridge ---------------------------------------------
+  // Aether loads src/aether.ts in a separate jiti loader. It reads live state
+  // and calls controls through this globalThis handle. The timer only asks
+  // Aether to re-render; rendering itself reads getSnapshot() directly, so
+  // per-second refreshes do not persist anything.
+  function buildAetherSnapshot(): SubagentsSnapshot {
+    const emptyActivity = new Map<string, string>();
+    const agents: SubagentSnapshotAgent[] = manager.listAgents()
+      .filter((record) => record.parentAgentId === undefined)
+      .map((record) => {
+        const activity = agentActivity.get(record.id);
+        const invocation = buildInvocationTags(record.invocation);
+        const result = record.result ?? "";
+        return {
+          id: record.id,
+          type: record.type,
+          displayName: getDisplayName(record.type),
+          description: record.description,
+          handle: record.handle,
+          alias: record.alias,
+          status: record.status,
+          toolUses: record.toolUses,
+          tokens: formatTokens(getLifetimeTotal(record.lifetimeUsage)),
+          turnCount: activity?.turnCount ?? 0,
+          maxTurns: activity?.maxTurns,
+          durationMs: (record.completedAt ?? Date.now()) - record.startedAt,
+          startedAt: record.startedAt,
+          completedAt: record.completedAt,
+          activity: describeActivity(activity?.activeTools ?? emptyActivity, activity?.responseText),
+          spinnerFrame: record.status === "running" ? Math.floor(Date.now() / 80) % SPINNER.length : 0,
+          modelName: invocation.modelName ?? "",
+          tags: invocation.tags,
+          outputFile: record.outputFile,
+          error: record.error,
+          resultPreview: result.length > 240 ? `${result.slice(0, 239).trimEnd()}…` : result,
+          result,
+          isBackground: record.isBackground,
+        };
+      });
+    const types = getAllTypes().map((name) => {
+      const cfg = getAgentConfig(name);
+      return {
+        name,
+        displayName: cfg?.displayName ?? name,
+        description: cfg?.description ?? name,
+        enabled: cfg?.enabled !== false,
+        isDefault: cfg?.isDefault === true,
+        source: cfg?.source ?? "default",
+      };
+    });
+    return {
+      agents,
+      types,
+      queued: agents.filter((agent) => agent.status === "queued").length,
+      running: agents.filter((agent) => agent.status === "running").length,
+      settings: { ...snapshotSettings() },
+    };
+  }
+
+  function toggleAgentFromAether(name: string): { ok: boolean; message: string } {
+    const cfg = getAgentConfig(name);
+    if (!cfg) return { ok: false, message: `Agent not found: ${name}` };
+    const file = locateAgentFile(name, cfg.sourcePath);
+    if (cfg.enabled === false) {
+      if (!file) return { ok: false, message: `${name} has no editable file to re-enable.` };
+      const content = readFileSync(file.path, "utf-8");
+      const enabled = enableInContent(content);
+      if (!enabled.changed && !isEmptyStub(enabled.content)) {
+        return { ok: false, message: `${name} is not disabled in ${file.path}.` };
+      }
+      if (isEmptyStub(enabled.content)) {
+        unlinkSync(file.path);
+        reloadCustomAgents();
+        return { ok: true, message: `Enabled ${name} (removed ${file.path})` };
+      }
+      writeFileSync(file.path, enabled.content, "utf-8");
+      reloadCustomAgents();
+      return { ok: true, message: `Enabled ${name} (${file.path})` };
+    }
+
+    if (file) {
+      const content = readFileSync(file.path, "utf-8");
+      const disabled = disableInContent(content);
+      if (disabled.outcome === "already-disabled") {
+        return { ok: false, message: `${name} is already disabled.` };
+      }
+      if (disabled.outcome === "no-frontmatter") {
+        return { ok: false, message: `Cannot disable ${name}: ${file.path} has no frontmatter block.` };
+      }
+      writeFileSync(file.path, disabled.content, "utf-8");
+      reloadCustomAgents();
+      return { ok: true, message: `Disabled ${name} (${file.path})` };
+    }
+
+    const targetDir = projectAgentsDir();
+    mkdirSync(targetDir, { recursive: true });
+    const targetPath = join(targetDir, `${name}.md`);
+    if (existsSync(targetPath)) {
+      return { ok: false, message: `${targetPath} already exists — reload agents first.` };
+    }
+    writeFileSync(targetPath, "---\nenabled: false\n---\n", "utf-8");
+    reloadCustomAgents();
+    return { ok: true, message: `Disabled ${name} (${targetPath})` };
+  }
+
+  const aetherBridge: SubagentsPiBridge = {
+    getSnapshot: buildAetherSnapshot,
+    getConversation: (id: string) => {
+      const record = manager.getRecord(id);
+      return record?.session ? getAgentConversation(record.session) : undefined;
+    },
+    getResult: (id: string) => manager.getRecord(id)?.result,
+    steer: (id: string, message: string) => {
+      const steered = manager.steer(id, message);
+      if (steered) pi.events.emit("subagents:steered", { id, message });
+      return steered;
+    },
+    abort: (id: string) => manager.abort(id),
+    applySetting: (id: string, value: unknown) => {
+      const outcome = applySettingToRuntime(id, value);
+      if (!outcome) return { ok: false, message: `Invalid value for ${id}.` };
+      if (outcome.changed) {
+        pi.events.emit("subagents:settings_changed", { settings: snapshotSettings(), persisted: true });
+      }
+      return { ok: true, message: outcome.message };
+    },
+    reloadAgents: () => reloadCustomAgents(),
+    toggleAgent: toggleAgentFromAether,
+    dispatchMention: async (text: string): Promise<MentionDispatchResult> => {
+      if (!currentCtx) return { action: "continue" };
+      return handleMentionInput({ text }, currentCtx, true);
+    },
+  };
+  registerSubagentsBridge(aetherBridge);
+
+  const aetherRefreshTimer = setInterval(() => {
+    if (aetherBridge.api && manager.hasRunning()) {
+      aetherBridge.api.invalidate?.();
+    }
+  }, 1000);
+  aetherRefreshTimer.unref?.();
 
   pi.registerCommand("agents", {
     description: "Manage agents",

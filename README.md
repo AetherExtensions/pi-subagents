@@ -10,6 +10,20 @@ https://github.com/user-attachments/assets/8685261b-9338-4fea-8dfe-1c590d5df543
 <img width="600" alt="pi-color-badges-white" src="https://github.com/user-attachments/assets/555dcae4-333e-4ff0-b420-7b3369c018a4" />
 
 
+## Aether integration
+
+This is the **Aether-enabled fork** of [pi-subagents](https://github.com/tintinweb/pi-subagents) by the [Aether](https://aether.baimoqilin.com) team. The Pi extension itself keeps working unchanged; the Aether Script Mod (`src/aether.ts`) re-homes the TUI-only surfaces on Aether Script API v2 when the package runs inside Aether:
+
+- **Native settings page** — every `/agents → Settings` value is mirrored to the same `.pi/subagents.json` used by the Pi extension, so Aether and Pi CLI stay in sync.
+- **Live agent roster** — the persistent widget and FleetView are folded into tappable cards above the Aether composer, with status, activity, stats, Stop, Result, and Conversation controls.
+- **Tool-card titles** — `Agent`, `get_subagent_result`, and `steer_subagent` show semantic running/completed titles in Aether tool cards.
+- **Conversation viewer overlay** — View opens an `app.overlay` transcript viewer with live auto-refresh while the agent runs, an inline steering field, and a Stop control.
+- **Styled transcript messages** — background completion, full-result, and conversation exports render as native Aether message cards.
+- **Agent mentions** — `@handle message` is intercepted by Aether's `before_send` hook and routed through the Pi extension's mention dispatcher, preserving steer/resume/start behavior without a main-model turn.
+- **Agent-type management page** — enable/disable built-in and custom agent definitions, reload agent files, and draft a new agent definition from Aether settings.
+
+No Native Mod is required; the Script Mod covers all adapted surfaces. Script changes hot-reload in Aether.
+
 ## Features
 
 - **Claude Code look & feel** — same tool names, calling conventions, and UI patterns (`Agent`, `get_subagent_result`, `steer_subagent`) — feels native
@@ -47,6 +61,10 @@ Or load directly for development:
 ```bash
 pi -e ./src/index.ts
 ```
+
+### In Aether
+
+Import the release package in Aether via **Settings → Extensions → Import extension**. The package contains the Pi extension and the Aether Script Mod; no restart is required for Script Mod changes during development, while installing an updated package follows Aether's normal extension reload flow.
 
 ## Quick Start
 
